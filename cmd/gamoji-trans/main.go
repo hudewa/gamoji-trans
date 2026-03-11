@@ -1,0 +1,348 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"gamoji-trans/internal/generator"
+	"gamoji-trans/internal/replacer"
+	"gamoji-trans/internal/scanner"
+	"gamoji-trans/internal/translator"
+	"gamoji-trans/pkg/config"
+)
+
+var (
+	cfgFile    string
+	scanDir    string
+	outputDir  string
+	replace    bool
+	dryRun     bool
+	apiKey     string
+	baseURL    string
+	model      string
+	moduleName string
+)
+
+var rootCmd = &cobra.Command{
+	Use:   "gamoji-trans",
+	Short: "A CLI tool for translating Chinese text in code to multiple languages",
+	Long: `gamoji-trans scans code for Chinese text, translates it using Doubao AI,
+and generates SQL files for i18n. It can also replace the original Chinese
+text with module.identification format.`,
+}
+
+var scanCmd = &cobra.Command{
+	Use:   "scan",
+	Short: "Scan directory for Chinese text",
+	Long:  `Scan the specified directory for Chinese text wrapped in quotes.`,
+	RunE:  runScan,
+}
+
+var translateCmd = &cobra.Command{
+	Use:   "translate",
+	Short: "Scan and translate Chinese text",
+	Long:  `Scan the directory for Chinese text and translate it using Doubao AI.`,
+	RunE:  runTranslate,
+}
+
+var processCmd = &cobra.Command{
+	Use:   "process",
+	Short: "Full process: scan, translate, generate SQL, and optionally replace",
+	Long: `Complete workflow: scan for Chinese text, translate using Doubao AI,
+generate SQL file, and optionally replace original text with module.identification format.`,
+	RunE: runProcess,
+}
+
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Create an example configuration file",
+	Long:  `Create an example configuration file at the specified path.`,
+	RunE:  runInit,
+}
+
+func init() {
+	// Global flags
+	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file path")
+
+	// Scan command flags
+	scanCmd.Flags().StringVarP(&scanDir, "dir", "d", ".", "directory to scan")
+
+	// Translate command flags
+	translateCmd.Flags().StringVarP(&scanDir, "dir", "d", ".", "directory to scan")
+	translateCmd.Flags().StringVarP(&outputDir, "output", "o", "./sql", "output directory for SQL files")
+	translateCmd.Flags().StringVarP(&apiKey, "api-key", "k", "", "Doubao API key (or set DOUBAO_API_KEY env var)")
+	translateCmd.Flags().StringVar(&baseURL, "base-url", "", "Doubao API base URL")
+	translateCmd.Flags().StringVarP(&model, "model", "m", "", "Doubao model name")
+	translateCmd.Flags().StringVar(&moduleName, "module", "", "module name for identification")
+
+	// Process command flags
+	processCmd.Flags().StringVarP(&scanDir, "dir", "d", ".", "directory to scan")
+	processCmd.Flags().StringVarP(&outputDir, "output", "o", "./sql", "output directory for SQL files")
+	processCmd.Flags().BoolVar(&replace, "replace", false, "replace original text with module.identification")
+	processCmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be replaced without making changes")
+	processCmd.Flags().StringVarP(&apiKey, "api-key", "k", "", "Doubao API key (or set DOUBAO_API_KEY env var)")
+	processCmd.Flags().StringVar(&baseURL, "base-url", "", "Doubao API base URL")
+	processCmd.Flags().StringVarP(&model, "model", "m", "", "Doubao model name")
+	processCmd.Flags().StringVar(&moduleName, "module", "", "module name for identification")
+
+	// Init command flags
+	initCmd.Flags().StringVarP(&cfgFile, "output", "o", "config.yaml", "output file path")
+
+	// Add commands
+	rootCmd.AddCommand(scanCmd)
+	rootCmd.AddCommand(translateCmd)
+	rootCmd.AddCommand(processCmd)
+	rootCmd.AddCommand(initCmd)
+}
+
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runScan(cmd *cobra.Command, args []string) error {
+	// Load config
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Create scanner
+	s := scanner.New(cfg.Scan.IncludeExt, cfg.Scan.ExcludeDirs, cfg.Scan.ExcludePatterns)
+
+	fmt.Printf("Scanning directory: %s\n", scanDir)
+	fmt.Println("This may take a while...")
+
+	// Scan directory
+	matches, err := s.Scan(scanDir)
+	if err != nil {
+		return fmt.Errorf("scan failed: %w", err)
+	}
+
+	// Display results
+	fmt.Printf("\nFound %d Chinese text occurrences:\n", len(matches))
+	fmt.Println(strings.Repeat("=", 60))
+
+	files := scanner.GroupByFile(matches)
+	for filePath, fileMatches := range files {
+		fmt.Printf("\nFile: %s\n", filePath)
+		for _, m := range fileMatches {
+			fmt.Printf("  Line %d, Col %d: %s\n", m.Line, m.Column, m.RawText)
+		}
+	}
+
+	return nil
+}
+
+func runTranslate(cmd *cobra.Command, args []string) error {
+	// Load config
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Override config with command line flags
+	if apiKey != "" {
+		cfg.Doubao.APIKey = apiKey
+	}
+	if baseURL != "" {
+		cfg.Doubao.BaseURL = baseURL
+	}
+	if model != "" {
+		cfg.Doubao.Model = model
+	}
+	if moduleName != "" {
+		cfg.Output.ModuleName = moduleName
+	}
+
+	// Validate config
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	// Create scanner
+	s := scanner.New(cfg.Scan.IncludeExt, cfg.Scan.ExcludeDirs, cfg.Scan.ExcludePatterns)
+
+	fmt.Printf("Scanning directory: %s\n", scanDir)
+
+	// Scan directory
+	matches, err := s.Scan(scanDir)
+	if err != nil {
+		return fmt.Errorf("scan failed: %w", err)
+	}
+
+	if len(matches) == 0 {
+		fmt.Println("No Chinese text found.")
+		return nil
+	}
+
+	fmt.Printf("Found %d Chinese text occurrences\n", len(matches))
+
+	// Get unique Chinese texts
+	uniqueTexts := scanner.UniqueChineseTexts(matches)
+	fmt.Printf("Unique texts to translate: %d\n", len(uniqueTexts))
+
+	// Create translator
+	t := translator.New(cfg.Doubao.APIKey, cfg.Doubao.BaseURL, cfg.Doubao.Model)
+
+	fmt.Println("Translating...")
+
+	// Translate
+	ctx := context.Background()
+	results, err := t.TranslateTexts(ctx, uniqueTexts, nil)
+	if err != nil {
+		return fmt.Errorf("translation failed: %w", err)
+	}
+
+	// Create generator
+	g := generator.New(outputDir, cfg.Output.ModuleName, cfg.Output.UpdatedBy)
+
+	// Generate SQL
+	sqlPath, err := g.GenerateSQL(results)
+	if err != nil {
+		return fmt.Errorf("failed to generate SQL: %w", err)
+	}
+
+	fmt.Printf("\nSQL file generated: %s\n", sqlPath)
+
+	// Print report
+	report := g.GenerateReport(results)
+	fmt.Println(report)
+
+	return nil
+}
+
+func runProcess(cmd *cobra.Command, args []string) error {
+	// Load config
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Override config with command line flags
+	if apiKey != "" {
+		cfg.Doubao.APIKey = apiKey
+	}
+	if baseURL != "" {
+		cfg.Doubao.BaseURL = baseURL
+	}
+	if model != "" {
+		cfg.Doubao.Model = model
+	}
+	if moduleName != "" {
+		cfg.Output.ModuleName = moduleName
+	}
+
+	// Validate config
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	// Create scanner
+	s := scanner.New(cfg.Scan.IncludeExt, cfg.Scan.ExcludeDirs, cfg.Scan.ExcludePatterns)
+
+	fmt.Printf("Scanning directory: %s\n", scanDir)
+
+	// Scan directory
+	matches, err := s.Scan(scanDir)
+	if err != nil {
+		return fmt.Errorf("scan failed: %w", err)
+	}
+
+	if len(matches) == 0 {
+		fmt.Println("No Chinese text found.")
+		return nil
+	}
+
+	fmt.Printf("Found %d Chinese text occurrences\n", len(matches))
+
+	// Get unique Chinese texts and their IDs
+	uniqueTexts := scanner.UniqueChineseTexts(matches)
+	fmt.Printf("Unique texts to translate: %d\n", len(uniqueTexts))
+
+	// Create translator
+	t := translator.New(cfg.Doubao.APIKey, cfg.Doubao.BaseURL, cfg.Doubao.Model)
+
+	fmt.Println("Translating...")
+
+	// Translate
+	ctx := context.Background()
+	results, err := t.TranslateTexts(ctx, uniqueTexts, nil)
+	if err != nil {
+		return fmt.Errorf("translation failed: %w", err)
+	}
+
+	// Create generator
+	g := generator.New(outputDir, cfg.Output.ModuleName, cfg.Output.UpdatedBy)
+
+	// Generate SQL
+	sqlPath, err := g.GenerateSQL(results)
+	if err != nil {
+		return fmt.Errorf("failed to generate SQL: %w", err)
+	}
+
+	fmt.Printf("\nSQL file generated: %s\n", sqlPath)
+
+	// Print report
+	report := g.GenerateReport(results)
+	fmt.Println(report)
+
+	// Create a map of Chinese text to ID for replacement
+	textToID := make(map[string]string)
+	for _, result := range results {
+		if result.Error == nil {
+			textToID[result.Text] = result.ID
+		}
+	}
+
+	// Update match IDs from translation results
+	for i := range matches {
+		if id, ok := textToID[matches[i].ChineseText]; ok {
+			matches[i].ID = id
+		}
+	}
+
+	// Replace if requested
+	if replace || dryRun {
+		r := replacer.New(cfg.Output.ModuleName, dryRun)
+
+		if dryRun {
+			fmt.Println(r.Preview(matches))
+		}
+
+		if replace {
+			fmt.Println("Replacing Chinese text in files...")
+			replaceResults, err := r.ReplaceAll(matches)
+			if err != nil {
+				return fmt.Errorf("replacement failed: %w", err)
+			}
+
+			totalReplacements := 0
+			for _, rr := range replaceResults {
+				if rr.Error != nil {
+					fmt.Printf("  Error in %s: %v\n", rr.FilePath, rr.Error)
+				} else if rr.Replacements > 0 {
+					totalReplacements += rr.Replacements
+					fmt.Printf("  %s: %d replacements\n", rr.FilePath, rr.Replacements)
+				}
+			}
+			fmt.Printf("\nTotal replacements: %d\n", totalReplacements)
+		}
+	}
+
+	return nil
+}
+
+func runInit(cmd *cobra.Command, args []string) error {
+	if err := config.WriteExampleConfig(cfgFile); err != nil {
+		return fmt.Errorf("failed to create config file: %w", err)
+	}
+	fmt.Printf("Example configuration file created: %s\n", cfgFile)
+	return nil
+}
